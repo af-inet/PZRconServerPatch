@@ -12,6 +12,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
@@ -23,6 +24,9 @@ public class RCONServer {
     public static final int SERVERDATA_AUTH_RESPONSE = 2;
     public static final int SERVERDATA_EXECCOMMAND = 2;
     public static final int SERVERDATA_AUTH = 3;
+    private static final int MAX_CONNECTIONS = 10; // TODO: configurable
+    private static final int SOCKET_TIMEOUT = 1000 * 30; // 30 seconds socket timeout, TODO: configurable
+    private static final int MAX_PACKET_SIZE = 1024 * 8;
     private static RCONServer instance;
     private ServerSocket welcomeSocket;
     private ServerThread thread;
@@ -41,6 +45,9 @@ public class RCONServer {
             } else {
                 this.welcomeSocket.bind(new InetSocketAddress(var1));
             }
+
+            // FIX(server-socket-timeout): wake up the accept thread every 60 seconds.
+            this.welcomeSocket.setSoTimeout(SOCKET_TIMEOUT);
 
             DebugLog.log("RCON: listening on port " + var1);
         } catch (IOException e) {
@@ -119,6 +126,9 @@ public class RCONServer {
             try {
                 Socket socket = RCONServer.this.welcomeSocket.accept();
 
+                // FIX(client-socket-timeout): don't wait forever for client sockets to do something.
+                socket.setSoTimeout(SOCKET_TIMEOUT);
+
                 for(int index = 0; index < this.connections.size(); ++index) {
                     ClientThread thread = (ClientThread)this.connections.get(index);
                     if (!thread.isAlive()) {
@@ -126,7 +136,9 @@ public class RCONServer {
                     }
                 }
 
-                if (this.connections.size() >= 5) {
+                if (this.connections.size() >= RCONServer.MAX_CONNECTIONS) {
+                    // FIX(server-socket-timeout): log when we have too many connections.
+                    DebugLog.log("RCON: cannot accept new connections connections=" + this.connections.size());
                     socket.close();
                     return;
                 }
@@ -135,6 +147,11 @@ public class RCONServer {
                 ClientThread thread = new ClientThread(socket, RCONServer.this.password);
                 this.connections.add(thread);
                 thread.start();
+            } catch (SocketTimeoutException e) {
+                // FIX(server-socket-timeout): When the accept times out, let's check if we're in a bad state.
+                if (this.connections.size() >= MAX_CONNECTIONS) {
+                    DebugLog.log("RCON: accept timeout connections=" + this.connections.size());
+                }
             } catch (IOException e) {
                 if (!this.bQuit) {
                     e.printStackTrace();
@@ -213,20 +230,23 @@ public class RCONServer {
                         this.runInner();
                     } catch (SocketException var3) {
                         this.bQuit = true;
+                    } catch (SocketTimeoutException ste) {
+                        // FIX(client-socket-timeout): print a message when a client times out
+                        DebugLog.log("RCON: client socket timed out, closing connection: " + this.socket.toString());
+                        this.bQuit = true;
                     } catch (Exception e) {
+                        // FIX(client-unexpected-error): quit client thread on unexpected errors
+                        DebugLog.log("RCON: Fatal exception in client thread, closing: " + this.socket.toString());
+                        this.bQuit = true;
                         e.printStackTrace();
                     }
                 }
-
                 try {
                     this.socket.close();
                 } catch (IOException e) {
                     e.printStackTrace();
                 }
-
-                DebugLog.log("RCON: connection closed " + this.socket.toString());
             }
-
         }
 
         private void runInner() throws IOException {
@@ -238,6 +258,12 @@ public class RCONServer {
                 ByteBuffer buffer = ByteBuffer.wrap(bytes1);
                 buffer.order(ByteOrder.LITTLE_ENDIAN);
                 int var4 = buffer.getInt();
+                // FIX(packet-size-validation): prevent oversized or malformed packets
+                if (var4 <= 0 || var4 > MAX_PACKET_SIZE) {
+                    DebugLog.log("RCON: invalid packet size (" + var4 + "), closing client: " + this.socket.toString());
+                    this.bQuit = true;
+                    return;
+                }
                 int var5 = var4;
                 byte[] bytes2 = new byte[var4];
 
@@ -275,7 +301,8 @@ public class RCONServer {
                         buffer.putInt(0);
                         buffer.putShort((short)0);
                         this.out.write(buffer.array());
-                        this.out.write(buffer.array());
+                        // FIX(double-auth-send): don't double-write the auth packet
+                        // this.out.write(buffer.array());
                     }
                     break;
                 case 1:
@@ -288,7 +315,19 @@ public class RCONServer {
                         ++this.pendingCommands;
                         RCONServer.instance.toMain.add(command);
 
+                        // FIX(exec-timeout): don't allow ClientThreads to wait forever for a response.
+                        long timeout = System.currentTimeMillis() + SOCKET_TIMEOUT;
+
                         while(this.pendingCommands > 0) {
+
+                            // FIX(exec-timeout): check if the timeout has expired, if it has quit this thread.
+                            // TODO: configurable timeout
+                            if (System.currentTimeMillis() > timeout) {
+                                this.bQuit = true;
+                                DebugLog.log("RCON: command timeout, closing client: " + this.socket.toString());
+                                return;
+                            }
+
                             command = (ExecCommand)this.toThread.poll();
                             if (command != null) {
                                 --this.pendingCommands;
@@ -302,6 +341,7 @@ public class RCONServer {
                                     }
                                 }
                             }
+  
                         }
 
                         return;
@@ -370,6 +410,9 @@ public class RCONServer {
         }
 
         public void quit() {
+            // FIX(client-thread-quit-timeout): don't let the quit handler hang forever
+            long timeout = System.currentTimeMillis() + 5000; // TODO: configurable timeout
+
             if (this.socket != null) {
                 try {
                     this.socket.close();
@@ -380,7 +423,8 @@ public class RCONServer {
             this.bQuit = true;
             this.interrupt();
 
-            while(this.isAlive()) {
+            // FIX(client-thread-quit-timeout): check the timeout
+            while(this.isAlive() && System.currentTimeMillis() < timeout) {
                 try {
                     Thread.sleep(50L);
                 } catch (InterruptedException var2) {
