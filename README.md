@@ -20,10 +20,8 @@ Add timeout wherever possible. Here are the individual changes I've made:
 
 4. **FIX(client-thread-quit-timeout)**: don't let the quit handler hang forever
 
-5. **FIX(zombie-threads)**: monitor for zombie threads
+5. **FIX(double-auth-send)**: for some reason, the zomboids rcon server send the auth packet twice.
 
-6. **FIX(double-auth-send)**: for some reason, the zomboids rcon server send the auth packet twice.
+6. **FIX(client-unexpected-error)**: quit on unexpected errors in the ClientThread
 
-7. **FIX(client-unexpected-error)**: quit on unexpected errors in the ClientThread
-
-8. **FIX(packet-size-validation)**: don't trust the clients given packet size
+7. **FIX(packet-size-validation)**: don't trust the clients given packet size
